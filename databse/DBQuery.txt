@@ -1,0 +1,435 @@
+----------------------Trigger-------------------------------
+
+drop trigger bef_insert_slm;
+
+delimiter /
+create trigger bef_insert_slm
+after insert on stock_ledger_med
+for each row
+begin
+insert into medicine_store_info(stock_ledger_med_fk,medicine_id_fk,store_type,med_qty, status)
+values(NEW.stock_ledger_med_pk,NEW.med_com_name_fk,'centralstock',NEW.medicine_qty,'valid');
+end
+/
+
+drop trigger update_sub_stock;
+delimiter /
+create trigger update_sub_stock
+before insert on distributed_med_log
+for each row
+begin
+  declare aqty int default 0;
+  declare store_pk int default 0;
+  declare dqty int default 0;
+  declare temp int default 0;
+  set dqty=NEW.med_qty;
+  while( dqty > 0) DO
+    SELECT med_qty,medicine_store_pk INTO aqty,store_pk FROM medicine_store_info
+    where medicine_id_fk=NEW.med_id_fk
+    and store_type='substock'
+    and med_qty > 0 order by stock_ledger_med_fk limit 1;
+    IF aqty >= dqty then
+      update medicine_store_info
+      set med_qty=med_qty-dqty
+      where medicine_store_pk=store_pk;
+      set dqty=0;
+    ELSE
+      set dqty=dqty-aqty;
+      delete from medicine_store_info
+      where medicine_store_pk=store_pk;
+    END IF;
+  END while;
+end;
+/
+
+/////temp
+ (1)
+delimiter /
+create trigger update_sub_stock
+before insert on distributed_med_log
+for each row
+begin
+  declare qty int;
+  declare store_fk int;
+  SELECT med_qty,stock_ledger_med_fk INTO qty,store_fk FROM medicine_store_info
+  where medicine_id_fk=NEW.med_id_fk
+  and store_type='substock' limit 1;
+  update medicine_store_info
+  set med_qty=med_qty-NEW.med_qty
+  where medicine_id_fk=NEW.med_id_fk
+  and stock_ledger_med_fk=store_fk
+  and store_type='substock';
+end;
+/
+
+---------------Event-------------------------------------
+
+CREATE event check_exp
+on schedule every 1 day starts timestamp '2011-05-20 23:59:00'
+do
+update medicine_store_info,stock_ledger_med
+set status='expired'
+where stock_ledger_med_fk=stock_ledger_med_pk
+and expiring_dt < current_date
+and status='valid';
+
+
+
+---------------------Procedure-------------------------------
+drop procedure insert_dist_log;
+DELIMITER $$
+create procedure insert_dist_log(IN presno int)
+begin
+  declare id,qty int;
+  DECLARE finished INTEGER DEFAULT 0;
+  DECLARE mycursor cursor for
+  SELECT med_com_name_fk,med_qty FROM patient_med_info
+  where std_prescription_fk=presno
+  and state='delivered';
+  DECLARE CONTINUE HANDLER FOR NOT FOUND SET finished = 1;
+  open mycursor;
+    get_city: LOOP
+         FETCH mycursor INTO id,qty;
+         IF finished=1 THEN
+                LEAVE get_city;
+         END IF;
+         insert into distributed_med_log (med_id_fk, med_qty, prescription_fk)
+                values(id,qty,presno);
+        END LOOP get_city;
+end;
+$$
+
+call insert_dist_log();
+
+
+//Stock Transfer procedure
+
+DELIMITER $$
+create procedure transfer_stock(IN id int,IN trans_qty int)
+begin
+  declare central_qty int DEFAULT 0;
+  declare temp int DEFAULT 0;
+  declare stock_fk int DEFAULT 0;
+  declare store_pk int DEFAULT 0;
+  DECLARE finished INTEGER DEFAULT 0;
+  DECLARE tcursor cursor for
+  SELECT medicine_store_pk,stock_ledger_med_fk,med_qty FROM medicine_store_info
+  where medicine_id_fk=id
+  and store_type='centralstock'
+  and status='valid'
+  order by stock_ledger_med_fk;
+  DECLARE CONTINUE HANDLER FOR NOT FOUND SET finished = 1;
+  open tcursor;
+    get_city: LOOP
+         FETCH tcursor INTO store_pk,stock_fk,central_qty;
+         IF finished=1 THEN
+                LEAVE get_city;
+         END IF;
+         IF trans_qty=0 THEN
+                LEAVE get_city;
+         END IF;
+         IF trans_qty >= central_qty THEN
+            update  medicine_store_info
+            set store_type='substock'
+            where medicine_store_pk=store_pk;
+            set trans_qty = trans_qty - central_qty;
+         ELSE
+            SET central_qty = central_qty - trans_qty;
+            update  medicine_store_info
+            set med_qty=central_qty
+            where medicine_store_pk=store_pk;
+            insert into medicine_store_info(stock_ledger_med_fk, medicine_id_fk, store_type, med_qty,status)
+            values(stock_fk,id,'substock',trans_qty,'valid');
+          END IF;
+        END LOOP get_city;
+end;
+$$
+
+//Update med procedure
+
+drop procedure update_med_state;
+
+
+delimiter /
+create procedure update_med_state(IN presno int)
+begin
+  declare dqty int;
+  declare aqty int;
+  declare id int;
+  declare pk int;
+  DECLARE finished INTEGER DEFAULT 0;
+  DECLARE medcursor cursor for
+  SELECT patient_med_pk,med_com_name_fk,med_qty FROM patient_med_info
+  where std_prescription_fk=presno and state='notavailable'
+  or std_prescription_fk=presno and state='central';
+  DECLARE CONTINUE HANDLER FOR NOT FOUND SET finished = 1;
+  open medcursor;
+  get_city: LOOP
+    FETCH medcursor INTO pk,id,dqty;
+      IF finished=1 THEN
+                LEAVE get_city;
+         END IF;
+       SELECT sum(med_qty) INTO aqty FROM medicine_store_info
+        where medicine_id_fk=id
+        and store_type='substock';
+        if aqty >= dqty then
+          update patient_med_info
+          set state='sub'
+          where patient_med_pk=pk;
+        ELSE
+          SELECT sum(med_qty) INTO aqty FROM medicine_store_info
+          where medicine_id_fk=id
+          and store_type='centralstock';
+          if aqty >= dqty then
+            update patient_med_info
+            set state='central'
+            where patient_med_pk=pk;
+          end if;
+        end if;
+    END LOOP get_city;
+end;
+/
+
+/////////  Old 
+delimiter /
+create procedure update_med_state(IN presno int)
+begin
+  declare dqty int;
+  declare aqty int;
+  declare id int;
+  DECLARE finished INTEGER DEFAULT 0;
+  DECLARE medcursor cursor for
+  SELECT med_com_name_fk,med_qty FROM patient_med_info
+  where std_prescription_fk=presno
+  and state='notavailable';
+  DECLARE CONTINUE HANDLER FOR NOT FOUND SET finished = 1;
+  open medcursor;
+  get_city: LOOP
+    FETCH medcursor INTO id,dqty;
+      IF finished=1 THEN
+                LEAVE get_city;
+         END IF;
+       SELECT sum(med_qty) INTO aqty FROM medicine_store_info
+        where medicine_id_fk=id
+        and store_type='substock';
+        if aqty >= dqty then
+        update patient_med_info
+        set state='substock'
+        where med_com_name_fk=id;
+        end if;
+    END LOOP get_city;
+end;
+/
+
+--------------------------------VIEW-------------------------------------------
+
+// CENTRAL STOCK
+
+create or replace view central_stock_info
+as
+SELECT med_type,med_gen_name,med_com_name,med_weight,med_qty,pp_price,purchase_dt,manufacturing_dt,expiring_dt
+FROM medicine_store_info,stock_ledger_med,medicine_gen_info,medicine_com_info,stock_ledger_comp
+where store_type='centralstock'
+and status='valid'
+and stock_ledger_med_fk=stock_ledger_med_pk
+and sl_no_fk=sl_no_pk
+and medicine_id_fk=med_com_name_pk
+and med_gen_name_fk=med_gen_name_pk
+order by med_type asc;
+
+
+//Sub stock
+
+create or replace view stock_transfer
+as
+SELECT medicine_id_fk,med_type,med_gen_name,med_com_name,med_weight,sum(med_qty) as med_qty
+FROM medicine_store_info,medicine_gen_info,medicine_com_info
+where store_type='centralstock'
+and status='valid'
+and medicine_id_fk=med_com_name_pk
+and med_gen_name_fk=med_gen_name_pk
+group by medicine_id_fk
+order by med_type asc;
+
+
+
+// Central Stock
+
+SELECT med_type,med_gen_name,med_com_name,med_weight,med_qty,pp_price,purchase_dt,manufacturing_dt,expiring_dt
+FROM medicine_store_info,stock_ledger_med,medicine_gen_info,medicine_com_info,stock_ledger_comp
+where store_type='centralstock'
+and status='valid'
+and stock_ledger_med_fk=stock_ledger_med_pk
+and sl_no_fk=sl_no_pk
+and medicine_id_fk=med_com_name_pk
+and med_gen_name_fk=med_gen_name_pk
+order by med_type asc;
+
+
+//std prescription
+
+SELECT med_type,med_com_name,med_weight,no_of_doses,day_duration,med_qty,medication_inst_text,state
+FROM patient_med_info,medicine_gen_info,medicine_com_info,medication_inst_detail
+where std_prescription_fk=77
+and med_com_name_fk=med_com_name_pk
+and med_gen_name_fk=med_gen_name_pk
+and medication_inst_fk=medication_inst_pk
+order by med_type asc;
+
+
+
+
+// Help
+SELECT std_prescription_pk
+FROM std_prescription_info,student
+where student_pk_fk=student_pk
+and registration_no=2008331093
+order by std_prescription_pk desc limit 1
+
+//  Student profile
+create function p1() returns INTEGER DETERMINISTIC NO SQL return @p1;
+
+create view std_profile as
+select registration_no,session,full_name,fathers_name, mothers_name,sex,religion, nationality,date_of_birth,
+(YEAR(CURDATE())-YEAR(date_of_birth)) - (RIGHT(CURDATE(),5)<RIGHT(date_of_birth,5))
+AS age,contact_no, email_address,present_address,dept_name
+from student_personal_info,student,department,degree_offered_by_dept,
+student_batch where student_personal_pk_fk=student.student_pk
+and department.dept_pk=degree_offered_by_dept.department_fk
+and degree_offered_by_dept.dept_degree_pk=student_batch.dept_degree_fk
+and student_batch.student_batch_pk=student.student_batch_fk
+and student.student_pk= p1() ;
+
+select s.* from (select @p1:=23) parm , std_profile s;
+
+
+//  Employee profile
+
+create view emp_profile as
+select full_name,employee_code,designation_name,dept_name,fathers_name, mothers_name,sex,religion, nationality,date_of_birth,
+(YEAR(CURDATE())-YEAR(date_of_birth)) - (RIGHT(CURDATE(),5)<RIGHT(date_of_birth,5))
+AS age,contact_no, email_address,present_address
+from employee_personal_info,employee,employee_status,department,designation
+where employee_pk=employee_personal_pk_fk
+and employee_pk=employee_status_pk_fk
+and department_fk=dept_pk
+and designation_pk=designation_fk
+and employee_pk=p1();
+
+select s.* from (select @p1:=26) parm , emp_profile s;
+
+//    Employee payment medicine
+
+create view emp_medicine as
+SELECT std_prescription_fk,prescription_dt,med_type,med_com_name,med_weight,med_qty,pp_price
+FROM patient_med_info,stock_ledger_med,std_prescription_info,medicine_gen_info,medicine_com_info
+where slm_fk=stock_ledger_med_pk
+and std_prescription_fk=std_prescription_pk
+and student_pk_fk=p1()
+and patient_type='emp_patient'
+and patient_med_info.med_com_name_fk=med_com_name_pk
+and med_gen_name_fk=med_gen_name_pk
+order by prescription_dt;
+
+select s.* from (select @p1:=19 ) parm , emp_medicine s;
+
+//	Doctor's All Perscription
+
+create view see_doct_allprescription as
+SELECT std_prescription_pk,student_pk_fk,patient_type,prescription_dt,diagnosis_detail FROM std_prescription_info
+where emplaoyee_pk_fk=p1()
+order by prescription_dt desc;
+
+select s.* from (select @p1:=29 ) parm , see_doct_allprescription s;
+
+<><><><><><><><><><>	QUERY	<><><><><><><><><><><><>
+//  ALL MEDICINE
+SELECT med_type,med_com_name,med_weight,med_gen_name,manufacturing_dt,expiring_dt,store_type,med_qty as qty
+from medicine_store_info,medicine_com_info,medicine_gen_info,stock_ledger_med
+where medicine_id_fk=med_com_name_pk
+and med_gen_name_fk=med_gen_name_pk
+and med_type='Capsul'
+and stock_ledger_med_fk=stock_ledger_med_pk
+and status='valid'
+group by store_type,med_com_name order by med_type;
+
+
+///////////////////////////////////////////////////////////////////////////////////
+SELECT trigger_schema, trigger_name FROM information_schema.triggers;
+
+
+SELECT std_prescription_fk,prescription_dt,med_type,med_com_name,med_weight,med_qty,pp_price
+FROM patient_med_info,stock_ledger_med,std_prescription_info,medicine_gen_info,medicine_com_info
+where slm_fk=stock_ledger_med_pk
+and std_prescription_fk=std_prescription_pk
+and student_pk_fk=20
+and patient_type='emp_patient'
+and EXTRACT(YEAR_MONTH FROM prescription_dt)=201104
+and patient_med_info.med_com_name_fk=med_com_name_pk
+and med_gen_name_fk=med_gen_name_pk
+order by prescription_dt;
+
+
+
+<><><><><><><><><><>	Last Modified	<><><><><><><><><><><><>
+
+delimiter /
+create trigger update_sub_stock
+before insert on distributed_med_log
+for each row
+begin
+  declare aqty int default 0;
+  declare store_pk int default 0;
+  declare dqty int default 0;
+  declare temp int default 0;
+  set dqty=NEW.med_qty;
+  while( dqty > 0) DO
+    SELECT med_qty,medicine_store_pk INTO aqty,store_pk FROM medicine_store_info
+    where medicine_id_fk=NEW.med_id_fk
+    and store_type='substock'
+    and med_qty > 0 order by stock_ledger_med_fk limit 1;
+    IF aqty >= dqty then
+      update medicine_store_info
+      set med_qty=med_qty-dqty
+      where medicine_store_pk=store_pk;
+      set dqty=0;
+      update patient_med_info
+       set slm_fk=(SELECT stock_ledger_med_fk FROM medicine_store_info
+       where medicine_store_pk=store_pk)
+       where patient_med_pk=NEW.pt_med_fk;
+    ELSE
+      set dqty=dqty-aqty;
+      update patient_med_info
+       set slm_fk=(SELECT stock_ledger_med_fk FROM medicine_store_info
+       where medicine_store_pk=store_pk)
+       where patient_med_pk=NEW.pt_med_fk;
+      delete from medicine_store_info
+      where medicine_store_pk=store_pk;
+    END IF;
+  END while;
+end;
+/
+
+
+DELIMITER $$
+create procedure insert_dist_log(IN presno int)
+begin
+  declare pk,id,qty int;
+  DECLARE finished INTEGER DEFAULT 0;
+  DECLARE mycursor cursor for
+  SELECT patient_med_pk,med_com_name_fk,med_qty FROM patient_med_info
+  where std_prescription_fk=presno
+  and state='delivered';
+  DECLARE CONTINUE HANDLER FOR NOT FOUND SET finished = 1;
+  open mycursor;
+    get_city: LOOP
+         FETCH mycursor INTO pk,id,qty;
+         IF finished=1 THEN
+                LEAVE get_city;
+         END IF;
+         insert into distributed_med_log (med_id_fk, med_qty, prescription_fk,pt_med_fk)
+                values(id,qty,presno,pk);
+        END LOOP get_city;
+end;
+$$
+
