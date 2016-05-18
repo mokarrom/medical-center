@@ -32,7 +32,7 @@ System Interfaces
 - **Client on Internet:** Web Browser, Operating System (any).
 - **Client on Intranet:** Client Software, Web Browser, Operating System (any).
 - **Web Server:** Apache Tomcat, Operating System (any).
-- **Data Base:** MySQL.
+- **DataBase:** MySQL.
 
 User Interface
 --------------
